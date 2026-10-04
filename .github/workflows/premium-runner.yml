@@ -1,0 +1,67 @@
+name: Premium Watch public runner
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Select a read-only verification or one bounded monitoring slice
+        type: choice
+        options:
+          - verify
+          - scan
+        default: verify
+        required: true
+
+concurrency:
+  group: premium-watch-public-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  hosted-monitor:
+    if: ${{ github.event_name == 'schedule' || inputs.mode == 'verify' || inputs.mode == 'scan' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Set the provider deadline from job start
+        run: echo "PREMIUM_WATCH_PROVIDER_JOB_DEADLINE_EPOCH=$(( $(date +%s) + 810 ))" >> "$GITHUB_ENV"
+
+      - name: Check out public runner code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install bounded public HTTP dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Verify selected public shops without saving scan data or sending alerts
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'verify' }}
+        env:
+          PREMIUM_WATCH_PUBLIC_RUNNER: "true"
+          PREMIUM_WATCH_BILLING_MODE: public
+          PRIVATE_STATE_REPOSITORY: ${{ secrets.PRIVATE_STATE_REPOSITORY }}
+          PREMIUM_STATE_TOKEN: ${{ secrets.PREMIUM_STATE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m premiumwatch.hosted_runner verify
+
+      - name: Run one resumable hosted monitoring slice
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'scan') }}
+        env:
+          PREMIUM_WATCH_PUBLIC_RUNNER: "true"
+          PREMIUM_WATCH_BILLING_MODE: public
+          PRIVATE_STATE_REPOSITORY: ${{ secrets.PRIVATE_STATE_REPOSITORY }}
+          PREMIUM_STATE_TOKEN: ${{ secrets.PREMIUM_STATE_TOKEN }}
+          PREMIUM_WATCH_DISCORD_WEBHOOK: ${{ secrets.PREMIUM_WATCH_DISCORD_WEBHOOK }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m premiumwatch.hosted_runner scan
