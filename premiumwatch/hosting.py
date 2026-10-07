@@ -38,6 +38,7 @@ MAX_MONTHS = 3
 MAX_RUN_IDS_PER_MONTH = 100
 MAX_VERIFICATION_TASKS = 500
 STATE_VERSION = 1
+_UNSET_SNAPSHOT_SHA = object()
 
 _STATE_KEYS = {
     "schema_version", "repository", "armed", "paused", "generation",
@@ -831,31 +832,60 @@ class GitHubLedger:
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError):
             raise HostingError("The private application snapshot could not be validated.") from None
 
-    def upload_snapshot(self, snapshot: dict, *, expected_blob_sha: str | None = None) -> dict:
-        """Write a new allow-listed snapshot blob without duplicating it in heartbeats."""
+    def upload_snapshot(
+        self,
+        snapshot: dict,
+        *,
+        expected_blob_sha: str | None | object = _UNSET_SNAPSHOT_SHA,
+        authorize_recovery=None,
+    ) -> dict:
+        """Write an allow-listed snapshot using the state pointer and path SHA as separate CAS values.
+
+        ``expected_blob_sha`` is the authoritative immutable blob pointer from
+        monitor.json. The mutable Contents path can temporarily be ahead of that
+        pointer after an interrupted upload. Recover that case only after the
+        caller revalidates ownership and the unchanged pointer, then use the
+        current path SHA as the Contents API's compare-and-swap value.
+        """
         if self.require_private_repository:
             # Public runner jobs recheck visibility immediately before sensitive
             # snapshot writes, without adding a repository lookup to each lease fence.
             self.verify_private_repository()
         packed, uncompressed_bytes = pack_snapshot(snapshot)
-        # For ordinary Contents updates, the supplied SHA is itself the CAS
-        # precondition. Avoid a second path GET on every unit checkpoint.
-        current_sha = expected_blob_sha if expected_blob_sha is not None else self._current_blob_sha(SNAPSHOT_PATH)
-        if len(packed) <= 900_000:
-            payload = {
-                "branch": self.branch,
-                "message": "Update Premium Watch allow-listed snapshot [skip ci]",
-                "content": base64.b64encode(packed).decode("ascii"),
-            }
-            if current_sha:
-                payload["sha"] = current_sha
-            result = self.api(f"/repos/{self.repository}/contents/{SNAPSHOT_PATH}", method="PUT", data=payload)
-            try:
-                blob_sha = result["content"]["sha"]
-            except (KeyError, TypeError):
-                raise HostingError("GitHub did not confirm the private application snapshot.") from None
-        else:
-            blob_sha = self._write_large_blob(SNAPSHOT_PATH, packed, expected_blob_sha=current_sha)
+        has_expected_pointer = expected_blob_sha is not _UNSET_SNAPSHOT_SHA
+        if has_expected_pointer and expected_blob_sha is not None and (
+            not isinstance(expected_blob_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", expected_blob_sha) is None
+        ):
+            raise HostingError("The authoritative private snapshot reference is invalid.")
+        # Initial setup (no authoritative monitor pointer yet) keeps its
+        # historical path lookup. Active checkpoints use P directly, without a
+        # GET on the normal fast path.
+        current_sha = (
+            expected_blob_sha
+            if has_expected_pointer
+            else self._current_blob_sha(SNAPSHOT_PATH)
+        )
+        try:
+            blob_sha = self._upload_packed_snapshot(packed, current_sha)
+        except Conflict:
+            # Only an explicit server conflict is eligible. Timeouts and other
+            # uncertain outcomes never trigger another snapshot write.
+            if not has_expected_pointer or not callable(authorize_recovery):
+                raise
+            actual_path_sha = self._current_blob_sha(SNAPSHOT_PATH)
+            if actual_path_sha == current_sha:
+                raise
+            if self.require_private_repository:
+                # Recovery is a second sensitive write, so public runner jobs
+                # repeat the repository visibility gate before attempting it.
+                self.verify_private_repository()
+            if authorize_recovery() is not True:
+                raise HostingError("The private snapshot replacement was not authorized.") from None
+            # The Contents SHA is a second CAS: a concurrent path change after
+            # metadata inspection fails closed. The orphan's bytes are never
+            # read or treated as monitor state.
+            blob_sha = self._upload_packed_snapshot(packed, actual_path_sha)
         if not isinstance(blob_sha, str) or re.fullmatch(r"[0-9a-f]{40}", blob_sha) is None:
             raise HostingError("GitHub returned an invalid snapshot identifier.")
         return {
@@ -865,6 +895,25 @@ class GitHubLedger:
             "compressed_bytes": len(packed),
             "uncompressed_bytes": uncompressed_bytes,
         }
+
+    def _upload_packed_snapshot(self, packed: bytes, expected_path_sha: str | None) -> str:
+        """Write packed snapshot bytes with a CAS against the mutable path SHA."""
+        if len(packed) <= 900_000:
+            payload = {
+                "branch": self.branch,
+                "message": "Update Premium Watch allow-listed snapshot [skip ci]",
+                "content": base64.b64encode(packed).decode("ascii"),
+            }
+            if expected_path_sha:
+                payload["sha"] = expected_path_sha
+            result = self.api(f"/repos/{self.repository}/contents/{SNAPSHOT_PATH}", method="PUT", data=payload)
+            try:
+                blob_sha = result["content"]["sha"]
+            except (KeyError, TypeError, AttributeError):
+                raise HostingError("GitHub did not confirm the private application snapshot.") from None
+        else:
+            blob_sha = self._write_large_blob(SNAPSHOT_PATH, packed, expected_blob_sha=expected_path_sha)
+        return blob_sha
 
     def _current_blob_sha(self, path: str) -> str | None:
         try:
@@ -1095,6 +1144,18 @@ class SharedMonitor:
             return False
         return self.owned(state)
 
+    def _authorize_snapshot_recovery(self, expected_blob_sha: str | None, config_revision: str) -> bool:
+        """Revalidate the active owner and authoritative snapshot pointer before replacing an orphan path."""
+        state, _ = self.ledger.read()
+        if not self.owned(state):
+            raise HostingError("This monitor lost its shared lease; snapshot recovery was rejected.")
+        if state.get("config_revision") != config_revision:
+            raise HostingError("The application configuration changed; snapshot recovery was rejected.")
+        pointer_sha = (state.get("snapshot") or {}).get("blob_sha") or None
+        if pointer_sha != expected_blob_sha:
+            raise HostingError("The authoritative private snapshot changed; snapshot recovery was rejected.")
+        return True
+
     def acquire(self) -> tuple[bool, dict]:
         now = self.clock().astimezone(timezone.utc)
         acquired = {"ok": False, "generation": None, "reason": "lease_conflict"}
@@ -1189,9 +1250,13 @@ class SharedMonitor:
         if snapshot is not None:
             if not isinstance(snapshot, dict) or snapshot.get("config_revision") != current["config_revision"]:
                 raise HostingError("The application configuration changed; the cloud checkpoint was rejected.")
+            expected_pointer_sha = (current.get("snapshot") or {}).get("blob_sha") or None
             snapshot_pointer = self.ledger.upload_snapshot(
                 snapshot,
-                expected_blob_sha=(current.get("snapshot") or {}).get("blob_sha") or None,
+                expected_blob_sha=expected_pointer_sha,
+                authorize_recovery=lambda: self._authorize_snapshot_recovery(
+                    expected_pointer_sha, current["config_revision"],
+                ),
             )
         accepted = {"ok": False}
 
@@ -1199,6 +1264,11 @@ class SharedMonitor:
             if not self.owned(state):
                 raise HostingError("This monitor lost its shared lease; the checkpoint was rejected.")
             if snapshot is not None:
+                if state.get("config_revision") != current["config_revision"]:
+                    raise HostingError("The application configuration changed; the cloud checkpoint was rejected.")
+                current_pointer_sha = (state.get("snapshot") or {}).get("blob_sha") or None
+                if current_pointer_sha != expected_pointer_sha:
+                    raise HostingError("The authoritative private snapshot changed; the checkpoint was rejected.")
                 if snapshot_pointer is None or snapshot_pointer["config_revision"] != state["config_revision"]:
                     raise HostingError("The application configuration changed; the cloud checkpoint was rejected.")
                 state["snapshot"] = snapshot_pointer
@@ -1477,14 +1547,24 @@ class SharedMonitor:
         current, current_sha = self.ledger.read()
         if not self.owned(current):
             raise HostingError("This monitor lost its shared lease; the snapshot was rejected.")
+        expected_config_revision = current["config_revision"]
+        expected_pointer_sha = (current.get("snapshot") or {}).get("blob_sha") or None
         pointer = self.ledger.upload_snapshot(
             snapshot,
-            expected_blob_sha=(current.get("snapshot") or {}).get("blob_sha") or None,
+            expected_blob_sha=expected_pointer_sha,
+            authorize_recovery=lambda: self._authorize_snapshot_recovery(
+                expected_pointer_sha, expected_config_revision,
+            ),
         )
 
         def update(state: dict) -> None:
             if not self.owned(state):
                 raise HostingError("This monitor lost its shared lease; the snapshot pointer was rejected.")
+            if state.get("config_revision") != expected_config_revision:
+                raise HostingError("The application configuration changed; the snapshot pointer was rejected.")
+            current_pointer_sha = (state.get("snapshot") or {}).get("blob_sha") or None
+            if current_pointer_sha != expected_pointer_sha:
+                raise HostingError("The authoritative private snapshot changed; the snapshot pointer was rejected.")
             new_revision = snapshot["config_revision"]
             if new_revision != state["config_revision"]:
                 state["config_revision"] = new_revision

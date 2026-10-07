@@ -51,6 +51,10 @@ _EXTENSION_ORIGIN = re.compile(r"^chrome-extension://([a-p]{32})$")
 _PAIRING_CODE = re.compile(r"^[A-Z2-9]{8}$")
 _TOPIC_ID = re.compile(r"^[0-9]{1,20}$")
 _TOPIC_PATH = re.compile(r"/(?:topic|threads?)/([0-9]+)(?:[-/]|$)", re.IGNORECASE)
+_BROWSER_BRIDGE_SECTION_URL = re.compile(
+    r"^https://mediapsychos\.com/forum/(?P<forum_id>[1-9][0-9]{0,5})-"
+    r"(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)/\?sortby=start_date&sortdirection=desc$"
+)
 _BRIDGE_FAILURES = {
     "login_required": "The browser bridge reports that the forum tab is signed out.",
     "challenge": "The browser bridge encountered a forum site challenge.",
@@ -435,21 +439,21 @@ class PremiumService:
         }
 
     def browser_bridge_sections_payload(self) -> dict[str, Any]:
-        sources = {row["id"]: row for row in self.db.sources()}
+        sections_by_id = self._browser_bridge_sections_by_id()
         reports = {row["source_id"]: row for row in self.db.browser_bridge_sections()}
         sections = []
         intervals = []
-        for source_id, configured in _BROWSER_BRIDGE_SECTIONS.items():
-            source = sources.get(source_id)
-            if not source or source.get("platform") != "invision" or source.get("url") != configured["url"]:
-                continue
+        for source_id in sorted(sections_by_id):
+            configured = sections_by_id[source_id]
             report = reports.get(source_id) or {}
-            intervals.append(int(source.get("discovery_interval", 900)))
+            intervals.append(int(configured["discovery_interval"]))
             sections.append({
                 "source_id": source_id,
-                "section_url": configured["url"],
+                "section_url": configured["section_url"],
                 "scan_scope": configured["scan_scope"],
-                "enabled": bool(source.get("enabled", True)),
+                "name": configured["name"],
+                "forum_id": configured["forum_id"],
+                "enabled": bool(configured["enabled"]),
                 "baseline_complete": bool(report.get("baseline_complete")),
                 "cursor_topic_id": str(report.get("cursor_topic_id") or "") if report.get("baseline_complete") else "",
             })
@@ -458,15 +462,67 @@ class PremiumService:
             "poll_interval_seconds": min(intervals) if intervals else 900,
         }
 
+    @staticmethod
+    def _browser_bridge_section_for_source(source: dict[str, Any]) -> dict[str, Any] | None:
+        source_id = str(source.get("id") or "")
+        if not _SOURCE_ID.fullmatch(source_id) or source.get("platform") != "invision":
+            return None
+        url = str(source.get("url") or "")
+        configured = _BROWSER_BRIDGE_SECTIONS.get(source_id)
+        if configured:
+            if url != configured["url"]:
+                return None
+            forum_id = configured["forum_id"]
+            scan_scope = configured["scan_scope"]
+        else:
+            if len(url) > 512:
+                return None
+            match = _BROWSER_BRIDGE_SECTION_URL.fullmatch(url)
+            if not match:
+                return None
+            forum_id = match.group("forum_id")
+            scan_scope = "latest_page"
+        return {
+            "source_id": source_id,
+            "name": " ".join(str(source.get("name") or "").split()),
+            "forum_id": forum_id,
+            "url": url,
+            "section_url": url,
+            "scan_scope": scan_scope,
+            "enabled": bool(source.get("enabled", True)),
+            "discovery_interval": int(source.get("discovery_interval", 900)),
+        }
+
+    def _browser_bridge_sections_by_id(self) -> dict[str, dict[str, Any]]:
+        candidates: dict[str, dict[str, Any]] = {}
+        forum_ids: dict[str, list[str]] = {}
+        for source in self.db.sources():
+            configured = self._browser_bridge_section_for_source(source)
+            if not configured:
+                continue
+            source_id = configured["source_id"]
+            candidates[source_id] = configured
+            forum_ids.setdefault(configured["forum_id"], []).append(source_id)
+        ambiguous_ids = {
+            source_id
+            for source_ids in forum_ids.values() if len(source_ids) > 1
+            for source_id in source_ids
+        }
+        return {
+            source_id: configured
+            for source_id, configured in candidates.items()
+            if source_id not in ambiguous_ids
+        }
+
     def browser_bridge_status(self) -> dict[str, Any]:
         credentials = self.db.browser_bridge_credentials()
         paired = bool(credentials.get("token_hash") and credentials.get("extension_origin"))
-        sources = {row["id"]: row for row in self.db.sources()}
+        sections_by_id = self._browser_bridge_sections_by_id()
         reports = {row["source_id"]: row for row in self.db.browser_bridge_sections()}
         now = datetime.now(timezone.utc)
         sections = []
-        for source_id in _BROWSER_BRIDGE_SECTIONS:
-            source = sources.get(source_id)
+        for source_id in sorted(sections_by_id):
+            configured = sections_by_id[source_id]
             report = reports.get(source_id) or {}
             if not paired:
                 status = "unpaired"
@@ -475,7 +531,7 @@ class PremiumService:
                 if last_attempt is None:
                     status = "waiting"
                 else:
-                    stale_after = max(600, int((source or {}).get("discovery_interval", 900)) * _BRIDGE_STALE_INTERVALS)
+                    stale_after = max(600, int(configured["discovery_interval"]) * _BRIDGE_STALE_INTERVALS)
                     if (now - last_attempt).total_seconds() > stale_after:
                         status = "stale"
                     elif report.get("status") == "healthy":
@@ -486,27 +542,29 @@ class PremiumService:
                         status = "error"
             sections.append({
                 "source_id": source_id,
-                "scan_scope": _BROWSER_BRIDGE_SECTIONS[source_id]["scan_scope"],
+                "name": configured["name"],
+                "section_url": configured["section_url"],
+                "forum_id": configured["forum_id"],
+                "scan_scope": configured["scan_scope"],
                 "status": status,
-                "enabled": bool((source or {}).get("enabled", False)),
+                "enabled": bool(configured["enabled"]),
                 "baseline_complete": bool(report.get("baseline_complete")),
                 "last_reported_at": report.get("last_attempt_at"),
                 "last_success_at": report.get("last_success_at"),
                 "last_error": str(report.get("last_error") or "") if status in _BRIDGE_FAILURES or status == "error" else "",
                 "topic_count": int(report.get("last_topic_count") or 0),
                 "cursor_topic_id": str(report.get("cursor_topic_id") or ""),
+                "can_enable": bool(paired and status == "healthy" and report.get("baseline_complete")),
             })
-        can_enable = paired and len(sections) == len(_BROWSER_BRIDGE_SECTIONS) and all(
-            section["status"] == "healthy" and section["baseline_complete"] for section in sections
-        )
-        statuses = [section["status"] for section in sections]
+        can_enable = paired and any(section["can_enable"] for section in sections)
+        active_statuses = [section["status"] for section in sections if section["enabled"]]
         if not paired:
             status = "unpaired"
-        elif statuses and all(value == "healthy" for value in statuses):
+        elif active_statuses and all(value == "healthy" for value in active_statuses):
             status = "healthy"
-        elif any(value == "stale" for value in statuses):
+        elif any(value == "stale" for value in active_statuses):
             status = "stale"
-        elif any(value in _BRIDGE_FAILURES and value != "stale" for value in statuses):
+        elif any(value in _BRIDGE_FAILURES and value != "stale" for value in active_statuses):
             status = "error"
         else:
             status = "waiting"
@@ -611,7 +669,9 @@ class PremiumService:
         return {"ok": True, "accepted": False, "source_id": source_id, "status": status}
 
     @staticmethod
-    def _normalize_browser_topic(source_id: str, raw: Any) -> tuple[dict[str, Any], str, str, bool]:
+    def _normalize_browser_topic(
+        section: dict[str, Any], raw: Any,
+    ) -> tuple[dict[str, Any], str, str, bool]:
         if not isinstance(raw, dict) or set(raw) - {"topic_id", "title", "url", "started_at", "is_pinned"}:
             raise ValueError("invalid topic shape")
         is_pinned = raw.get("is_pinned")
@@ -636,7 +696,6 @@ class PremiumService:
         canonical_url = f"https://mediapsychos.com{parsed.path}"
         if "started_at" in raw and raw.get("started_at") not in (None, ""):
             normalize_time(raw["started_at"], default_now=False)
-        section = _BROWSER_BRIDGE_SECTIONS[source_id]
         product_id = f"invision:{section['forum_id']}:{topic_id}"
         return ({
             "product_id": product_id,
@@ -650,17 +709,18 @@ class PremiumService:
         if not isinstance(payload, dict):
             raise ValueError("The browser report must be a JSON object.")
         source_id = str(payload.get("source_id") or "")
-        if source_id not in _BROWSER_BRIDGE_SECTIONS:
-            raise ValueError("Unknown browser bridge section.")
         source = self.db.source(source_id)
-        if not source or source.get("platform") != "invision" or source.get("url") != _BROWSER_BRIDGE_SECTIONS[source_id]["url"]:
+        if not source:
+            raise ValueError("Unknown browser bridge section.")
+        section = self._browser_bridge_sections_by_id().get(source_id)
+        if not section or source.get("platform") != "invision" or source.get("url") != section["section_url"]:
             raise ValueError("The configured forum section does not match the browser bridge contract.")
 
         allowed_fields = {
             "source_id", "captured_at", "section_url", "report_id", "scan_mode", "complete",
             "pagination_complete", "pages_scanned", "overlap_topic_id", "status", "topics",
         }
-        if set(payload) - allowed_fields or payload.get("section_url") != _BROWSER_BRIDGE_SECTIONS[source_id]["url"]:
+        if set(payload) - allowed_fields or payload.get("section_url") != section["section_url"]:
             return self._record_browser_bridge_failure(source_id, "incomplete")
         try:
             report_id = str(uuid.UUID(str(payload.get("report_id") or "")))
@@ -685,7 +745,7 @@ class PremiumService:
             if payload.get("status") not in (None, ""):
                 return self._record_browser_bridge_failure(source_id, "incomplete")
             scan_mode = str(payload.get("scan_mode") or "")
-            scan_scope = _BROWSER_BRIDGE_SECTIONS[source_id]["scan_scope"]
+            scan_scope = section["scan_scope"]
             allowed_modes = {"full", "overlap"} if scan_scope == "full" else {"latest_page"}
             if scan_mode not in allowed_modes:
                 return self._record_browser_bridge_failure(source_id, "incomplete")
@@ -711,7 +771,7 @@ class PremiumService:
             ordered_ids: list[str] = []
             ordered_unpinned_times: list[datetime | None] = []
             for raw in raw_topics:
-                product, topic_id, started_at, is_pinned = self._normalize_browser_topic(source_id, raw)
+                product, topic_id, started_at, is_pinned = self._normalize_browser_topic(section, raw)
                 existing = normalized_by_id.get(topic_id)
                 if existing:
                     if (
@@ -746,6 +806,11 @@ class PremiumService:
             with self.db.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current_source = self.db.source(source_id, connection=connection) or source
+                if (
+                    current_source.get("platform") != "invision" or
+                    current_source.get("url") != section["section_url"]
+                ):
+                    raise ValueError("The configured forum section changed during the browser report.")
                 current_bridge = self.db.browser_bridge_section(source_id, connection=connection) or {}
                 if self.db.browser_bridge_report_accepted(source_id, report_id, connection=connection):
                     return {
@@ -766,8 +831,8 @@ class PremiumService:
                 normalized = [normalize_product(normalized_by_id[topic_id][0], source=current_source) for topic_id in ordered_ids]
                 completed_at = utc_now()
                 allow_events = self._browser_bridge_events_enabled(
-                    source_id, previously_baselined=bool(current_bridge.get("baseline_complete")),
-                    source=current_source, connection=connection,
+                    previously_baselined=bool(current_bridge.get("baseline_complete")),
+                    source=current_source,
                 )
                 new_topics = self._apply_discovery(
                     current_source, normalized, completed_at, connection=connection,
@@ -792,23 +857,14 @@ class PremiumService:
             "baseline_complete": True, "topic_count": len(ordered_ids), "new_topics": new_topics,
         }
 
-    def _browser_bridge_events_enabled(self, source_id: str, *, previously_baselined: bool,
-                                      source: dict[str, Any], connection: Any) -> bool:
-        if (
-            not previously_baselined or not source.get("enabled", True) or
-            not source.get("discovery_enabled", True)
-        ):
-            return False
-        for other_id in _BROWSER_BRIDGE_SECTIONS:
-            if other_id == source_id:
-                continue
-            report = self.db.browser_bridge_section(other_id, connection=connection) or {}
-            # Both sections must have a complete quiet baseline before alerts start.
-            # Later failures or stale reports affect health and enable gating, but
-            # must not silently consume new IDs from the other enabled section.
-            if not report.get("baseline_complete"):
-                return False
-        return True
+    def _browser_bridge_events_enabled(self, *, previously_baselined: bool,
+                                      source: dict[str, Any]) -> bool:
+        # Each forum has its own quiet baseline. A newly added or repaired forum
+        # must not suppress alerts from another forum that is already baselined.
+        return bool(
+            previously_baselined and source.get("enabled", True) and
+            source.get("discovery_enabled", True)
+        )
 
     def upsert_source(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -818,13 +874,38 @@ class PremiumService:
         merged = dict(previous or {})
         merged.update(payload)
         source = self._validate_source(merged)
-        if source_id in _BROWSER_BRIDGE_SECTIONS:
-            if source.get("platform") != "invision" or source.get("url") != _BROWSER_BRIDGE_SECTIONS[source_id]["url"]:
-                raise ValueError("This forum section must keep its configured Media Psychos listing URL.")
-            if source.get("enabled") and not bool((previous or {}).get("enabled", False)):
-                bridge = self.browser_bridge_status()
-                if not bridge.get("can_enable_sources"):
-                    raise ValueError("Verify both forum sections with the paired browser extension before enabling forum alerts.")
+        previous_section = self._browser_bridge_section_for_source(previous) if previous else None
+        if previous_section and (
+            source.get("platform") != "invision" or
+            source.get("url") != previous_section["section_url"]
+        ):
+            raise ValueError(
+                "A configured Media Psychos forum source must keep its section URL and platform; use a new source ID for another forum."
+            )
+        if source_id in _BROWSER_BRIDGE_SECTIONS and (
+            source.get("platform") != "invision" or
+            source.get("url") != _BROWSER_BRIDGE_SECTIONS[source_id]["url"]
+        ):
+            raise ValueError("This forum section must keep its configured Media Psychos listing URL.")
+        if source.get("platform") == "invision":
+            section = self._browser_bridge_section_for_source(source)
+            if not section:
+                raise ValueError(
+                    "Media Psychos forum sources must use the exact HTTPS forum listing URL sorted by start date descending."
+                )
+            for other in self.db.sources():
+                if other["id"] == source_id or other.get("platform") != "invision":
+                    continue
+                other_section = self._browser_bridge_section_for_source(other)
+                if other_section and other_section["forum_id"] == section["forum_id"]:
+                    raise ValueError("A Media Psychos forum ID can be configured only once.")
+            if source.get("enabled") and previous and not bool(previous.get("enabled", False)):
+                bridge_section = next((
+                    row for row in self.browser_bridge_status()["sections"]
+                    if row["source_id"] == source_id
+                ), None)
+                if not bridge_section or not bridge_section.get("can_enable"):
+                    raise ValueError("Verify this forum section with the paired browser extension before enabling forum alerts.")
         self.db.upsert_source(source)
         if previous and bool(previous.get("discovery_enabled", True)) != source["discovery_enabled"]:
             if source["discovery_enabled"]:
@@ -1030,6 +1111,11 @@ class PremiumService:
                 self._wake_event.wait(2.0)
                 self._wake_event.clear()
                 continue
+            # Deliver already-due alerts before a potentially long provider cycle.
+            # Keep the post-cycle drain below for alerts created by this cycle.
+            self._drain_outbox()
+            if self._stop_event.is_set():
+                break
             try:
                 request = self._manual_queue.get_nowait()
             except queue.Empty:
@@ -2123,6 +2209,21 @@ class PremiumService:
                 controller_ok = self._controller_after_local_work(metadata)
             return callback_ok and controller_ok
 
+        def defer_before_post(row: dict[str, Any], error: str) -> bool:
+            # These branches prove that no Discord request began. Keep the
+            # alert due for a later fenced attempt instead of stranding it as
+            # an ambiguous delivery.
+            attempts = int(row["attempts"]) + 1
+            delay = min(30 * (2 ** min(attempts - 1, 7)), 3600)
+            self.db.mark_outbox_retry(
+                row["id"], attempts=attempts,
+                next_attempt_at=_after_seconds(utc_now(), delay), error=error,
+            )
+            if not checkpoint_result(row["id"], "retry"):
+                self._last_delivery_status = "checkpoint_failed"
+                return False
+            return True
+
         if not self._delivery_lock.acquire(blocking=False):
             self._last_delivery_status = "busy"
             return 0
@@ -2167,12 +2268,7 @@ class PremiumService:
                 except Exception as exc:
                     if not self.db.claim_outbox_sending(row["id"]):
                         continue
-                    self.db.mark_outbox_failed(
-                        row["id"], attempts=int(row["attempts"]) + 1,
-                        error=safe_error(exc),
-                    )
-                    if not checkpoint_result(row["id"], "failed"):
-                        self._last_delivery_status = "checkpoint_failed"
+                    if not defer_before_post(row, safe_error(exc)):
                         break
                     continue
                 if not self.db.claim_outbox_sending(row["id"]):
@@ -2181,29 +2277,21 @@ class PremiumService:
                     "phase": "sending_checkpoint", "outbox_id": row["id"],
                     "cursor": cursor, "delivered": delivered, **(progress or {}),
                 }):
-                    self.db.mark_outbox_uncertain(row["id"], error="Sending checkpoint was not accepted; outcome is held as uncertain.")
-                    checkpoint_result(row["id"], "uncertain")
+                    defer_before_post(row, "Sending checkpoint was not accepted before delivery; retry scheduled.")
                     self._last_delivery_status = "checkpoint_failed"
                     break
                 if not self.hosted_mode and not self._controller_after_local_work({
                     "phase": "sending_checkpoint", "outbox_id": row["id"], "cursor": cursor,
                 }):
-                    self.db.mark_outbox_uncertain(row["id"], error="Local state sync was not accepted before delivery; outcome is held as uncertain.")
-                    checkpoint_result(row["id"], "uncertain")
+                    defer_before_post(row, "Local state sync was not accepted before delivery; retry scheduled.")
                     self._last_delivery_status = "checkpoint_failed"
                     break
                 if not self._ownership_allowed("delivery_before_post"):
-                    self.db.mark_outbox_uncertain(row["id"], error="Ownership ended before delivery; automatic retry is held.")
-                    checkpoint_result(row["id"], "uncertain")
+                    defer_before_post(row, "Ownership ended before delivery; retry deferred.")
                     self._last_delivery_status = "ownership_lost"
                     break
                 if deadline is not None and deadline - time.monotonic() < 12.0:
-                    self.db.mark_outbox_retry(
-                        row["id"], attempts=int(row["attempts"]) + 1,
-                        next_attempt_at=_after_seconds(utc_now(), 30),
-                        error="Run deadline reached before delivery started.",
-                    )
-                    if not checkpoint_result(row["id"], "retry"):
+                    if not defer_before_post(row, "Run deadline reached before delivery started; retry scheduled."):
                         self._last_delivery_status = "checkpoint_failed"
                     if self._last_delivery_status != "complete":
                         break
@@ -2239,8 +2327,12 @@ class PremiumService:
                         self.db.mark_outbox_uncertain(row["id"], error=error)
                         self._last_delivery_status = "delivery_uncertain"
                     else:
-                        self.db.mark_outbox_failed(row["id"], attempts=int(row["attempts"]) + 1, error=error)
-                    if not checkpoint_result(row["id"], "uncertain" if post_started else "failed"):
+                        if not defer_before_post(row, error):
+                            self._last_delivery_status = "checkpoint_failed"
+                        if self._last_delivery_status != "complete":
+                            break
+                        continue
+                    if not checkpoint_result(row["id"], "uncertain"):
                         self._last_delivery_status = "checkpoint_failed"
                     if self._last_delivery_status != "complete":
                         break
